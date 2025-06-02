@@ -1,21 +1,19 @@
 /* ------------------------------------------------------------------
-   High-res YouTube video downloader
+   High-res YouTube video downloader  (Render-ready)
    • Streams ≤360 p directly (they already include audio).
-   • For 480 p / 720 p / 1080 p it downloads video-only + audio-only,
+   • For 480 p / 720 p / 1080 p it downloads video-only + audio-only,
      then muxes them into a *stream-friendly* fragmented MP4:
-        - if audio track is already AAC → copy
-        - if audio is Opus → transcode to AAC on the fly
+        – If audio track is AAC → copy
+        – If audio track is Opus → transcode to AAC on-the-fly
+   • Uses the **system ffmpeg** provided by `apk add ffmpeg`
+     (no @ffmpeg-installer dependency).
    ------------------------------------------------------------------ */
 
 const express = require("express");
 const cors = require("cors");
 const ytdl = require("@distube/ytdl-core");
 const pretty = require("pretty-bytes").default || require("pretty-bytes");
-
 const ffmpeg = require("fluent-ffmpeg");
-const ffmpegPath = require("@ffmpeg-installer/ffmpeg").path; // universal binary
-ffmpeg.setFfmpegPath(ffmpegPath);
-
 const { file } = require("tmp-promise");
 const fs = require("fs");
 
@@ -23,7 +21,7 @@ const app = express();
 const PORT = 3000;
 app.use(cors());
 
-/* ─── 15-minute in-memory cache for /info  ────────────────────────── */
+/* ─── 15-minute cache for /info ────────────────────────────────────── */
 const cache = new Map();
 const TTL = 900_000;
 
@@ -96,12 +94,12 @@ app.get("/download", async (req, res) => {
       `attachment; filename="${safeTitle}.mp4"`
     );
 
-    /* ≤360 p — already muxed */
+    /* ≤360 p — already contains audio */
     if (videoF.hasAudio) {
       return ytdl(videoUrl, { format: videoF }).pipe(res);
     }
 
-    /* >360 p — need to merge video-only + audio-only */
+    /* >360 p — merge video-only + audio-only */
     let audioF = info.formats.find(
       (f) =>
         f.hasAudio &&
@@ -125,7 +123,6 @@ app.get("/download", async (req, res) => {
       saveStream(videoUrl, audioF, aTmp.path),
     ]);
 
-    /* build FFmpeg pipeline */
     const mux = ffmpeg().input(vTmp.path).videoCodec("copy").input(aTmp.path);
 
     if (["m4a", "mp4"].includes(audioF.container)) {
@@ -135,7 +132,7 @@ app.get("/download", async (req, res) => {
     }
 
     mux
-      .outputOptions("-movflags", "frag_keyframe+empty_moov") // << stream-friendly
+      .outputOptions("-movflags", "frag_keyframe+empty_moov") // fragmented MP4
       .format("mp4")
       .on("start", (cmd) => console.log("[ffmpeg]", cmd))
       .on("stderr", (line) => process.stdout.write("[ffmpeg] " + line))
@@ -151,10 +148,10 @@ app.get("/download", async (req, res) => {
   }
 });
 
-/* helper: pipe ytdl stream → local file -------------------------------- */
-function saveStream(url, format, out) {
+/* helper: save a ytdl stream to disk */
+function saveStream(url, format, outPath) {
   return new Promise((ok, fail) => {
-    const ws = fs.createWriteStream(out);
+    const ws = fs.createWriteStream(outPath);
     ytdl(url, { format }).pipe(ws).on("finish", ok).on("error", fail);
   });
 }
