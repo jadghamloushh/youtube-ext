@@ -4,7 +4,7 @@
 
 const express  = require('express');
 const cors     = require('cors');
-const ytdl     = require('@distube/ytdl-core');
+const ytdl = require('ytdl-core');
 const pretty   = require('pretty-bytes').default || require('pretty-bytes');
 const ffmpeg   = require('fluent-ffmpeg');
 
