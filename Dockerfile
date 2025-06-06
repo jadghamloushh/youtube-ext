@@ -10,4 +10,5 @@ COPY . .
 
 EXPOSE 3000
 ENTRYPOINT ["/sbin/tini","--"]
+ENV YTDL_NO_UPDATE=1
 CMD ["node","server.js"]
