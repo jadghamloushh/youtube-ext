@@ -1,10 +1,11 @@
 /* ------------------------------------------------------------------
-   High-res YouTube downloader  (Render-ready, system ffmpeg)
+   High-res YouTube downloader  — Cloud-friendly version
+   (Works locally and on Render, Railway, Fly, etc.)
    ------------------------------------------------------------------ */
 
 const express = require("express");
 const cors = require("cors");
-const ytdl = require("@distube/ytdl-core");
+const ytdl = require("@distube/ytdl-core"); // 4.16.x or newer
 const pretty = require("pretty-bytes").default || require("pretty-bytes");
 const ffmpeg = require("fluent-ffmpeg");
 
@@ -14,7 +15,23 @@ const fs = require("fs");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Enhanced CORS configuration
+/* ------------------ 1.  global request headers ------------------- */
+/*  - normal Chrome UA (prevents some bot heuristics)
+    - personal cookie string solves geo/age/datacentre blocks
+      ↳ put it in Render → Environment →  YT_COOKIE=VISITOR_INFO1_LIVE=...; YSC=...; SID=...  */
+const COMMON = {
+  requestOptions: {
+    headers: {
+      "user-agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+        "AppleWebKit/537.36 (KHTML, like Gecko) " +
+        "Chrome/126.0 Safari/537.36",
+      cookie: process.env.YT_COOKIE || "",
+    },
+  },
+};
+
+/* ----------------------- 2. middleware --------------------------- */
 app.use(
   cors({
     origin: ["chrome-extension://*", "moz-extension://*", "*"],
@@ -23,14 +40,13 @@ app.use(
   })
 );
 
-// Add request logging
-app.use((req, res, next) => {
+app.use((req, _res, next) => {
   console.log(`${new Date().toISOString()} - ${req.method} ${req.url}`);
   next();
 });
 
-// Add a health check endpoint
-app.get("/", (req, res) => {
+/* simple health check */
+app.get("/", (_req, res) => {
   res.json({
     status: "OK",
     message: "YouTube Downloader API is running",
@@ -39,45 +55,32 @@ app.get("/", (req, res) => {
   });
 });
 
-/* ─── simple 15-min cache for /info ─────────────────────────────── */
+/* ------------------ 3.  15-min in-memory cache ------------------- */
 const cache = new Map();
 const TTL = 900_000;
 
-/* ---------------------------  /info  ----------------------------- */
+/* -------------------------- /info -------------------------------- */
 app.get("/info", async (req, res) => {
-  console.log("Info request received:", req.query);
-
   const videoUrl = req.query.url;
-  if (!videoUrl) {
-    return res.status(400).json({ error: "Missing URL parameter" });
-  }
 
-  if (!ytdl.validateURL(videoUrl)) {
+  if (!videoUrl) return res.status(400).json({ error: "Missing url param" });
+  if (!ytdl.validateURL(videoUrl))
     return res.status(400).json({ error: "Invalid YouTube URL" });
-  }
 
-  if (cache.has(videoUrl)) {
-    console.log("Returning cached result");
-    return res.json(cache.get(videoUrl));
-  }
+  if (cache.has(videoUrl)) return res.json(cache.get(videoUrl));
 
   try {
-    console.log("Fetching video info for:", videoUrl);
-
-    // Try getBasicInfo first, fallback to getInfo
+    /* Try lightweight call first, fall back to full info */
     let info;
     try {
-      info = await ytdl.getBasicInfo(videoUrl);
+      info = await ytdl.getBasicInfo(videoUrl, COMMON);
       if (!info.formats?.length) {
-        console.log("No formats in basic info, trying full info...");
-        info = await ytdl.getInfo(videoUrl);
+        info = await ytdl.getInfo(videoUrl, COMMON);
       }
-    } catch (basicError) {
-      console.log("Basic info failed, trying full info:", basicError.message);
-      info = await ytdl.getInfo(videoUrl);
+    } catch {
+      info = await ytdl.getInfo(videoUrl, COMMON);
     }
 
-    console.log("Got video info, processing formats...");
     const title = info.videoDetails.title;
     const buckets = {
       "1080p": null,
@@ -87,7 +90,6 @@ app.get("/info", async (req, res) => {
       audio: null,
     };
 
-    // Process formats
     for (const f of info.formats) {
       const q = f.qualityLabel || "";
       if (f.container === "mp4" && f.hasVideo) {
@@ -108,64 +110,41 @@ app.get("/info", async (req, res) => {
         sizeMB: f.contentLength ? pretty(+f.contentLength) : "—",
       }));
 
-    if (formats.length === 0) {
+    if (!formats.length)
       return res.status(404).json({ error: "No suitable formats found" });
-    }
 
     const payload = { title, formats };
     cache.set(videoUrl, payload);
     setTimeout(() => cache.delete(videoUrl), TTL);
 
-    console.log("Successfully processed video info");
-    res.json(payload);
+    return res.json(payload);
   } catch (err) {
-    console.error("[/info] Error details:", {
-      message: err.message,
-      stack: err.stack,
-      url: videoUrl,
-    });
+    console.error("[/info] FULL error:", err);
 
-    const msg = err?.message || "unknown";
+    const msg = String(err?.message || "");
+    if (msg.includes("age"))
+      return res.status(451).json({ error: "Age-restricted." });
+    if (msg.includes("403"))
+      return res.status(429).json({ error: "Throttled by YouTube." });
+    if (msg.includes("429"))
+      return res.status(429).json({ error: "Rate-limited." });
+    if (msg.includes("unavailable"))
+      return res.status(410).json({ error: "Video unavailable." });
 
-    if (msg.includes("Video unavailable"))
-      return res
-        .status(410)
-        .json({ error: "Video unavailable or region-blocked." });
-
-    if (msg.includes("confirm your age"))
-      return res
-        .status(451)
-        .json({ error: "Age-restricted, sign-in required." });
-
-    if (msg.includes("Status code: 403"))
-      return res
-        .status(429)
-        .json({ error: "YouTube throttled this server IP." });
-
-    if (msg.includes("Status code: 429"))
-      return res.status(429).json({ error: "Rate limited by YouTube." });
-
-    res.status(500).json({
-      error: "Failed to fetch video info",
-      details: process.env.NODE_ENV === "development" ? msg : undefined,
-    });
+    return res.status(500).json({ error: "Failed to fetch video info" });
   }
 });
 
-/* --------------------------  /download  -------------------------- */
+/* ------------------------- /download ----------------------------- */
 app.get("/download", async (req, res) => {
-  console.log("Download request received:", req.query);
-
   const { url: videoUrl, itag } = req.query;
+
   if (!ytdl.validateURL(videoUrl))
     return res.status(400).send("Invalid YouTube URL");
-
-  if (!itag) {
-    return res.status(400).send("Missing itag parameter");
-  }
+  if (!itag) return res.status(400).send("Missing itag parameter");
 
   try {
-    const info = await ytdl.getInfo(videoUrl);
+    const info = await ytdl.getInfo(videoUrl, COMMON);
     const videoF = info.formats.find((f) => f.itag == itag);
     if (!videoF) return res.status(404).send("itag not found");
 
@@ -176,16 +155,12 @@ app.get("/download", async (req, res) => {
     );
     res.header("Content-Type", "video/mp4");
 
-    console.log("Starting download for:", safeTitle);
-
-    /* ≤360 p – already has audio */
+    /* 360p or lower already contains audio */
     if (videoF.hasAudio) {
-      console.log("Direct download (has audio)");
-      return ytdl(videoUrl, { format: videoF }).pipe(res);
+      return ytdl(videoUrl, { ...COMMON, format: videoF }).pipe(res);
     }
 
-    /* >360 p – need to merge */
-    console.log("Need to merge video and audio");
+    /* higher resolutions → merge separate audio */
     let audioF = info.formats.find(
       (f) =>
         f.hasAudio &&
@@ -209,27 +184,23 @@ app.get("/download", async (req, res) => {
       save(videoUrl, audioF, aTmp.path),
     ]);
 
-    const mux = ffmpeg().input(vTmp.path).videoCodec("copy").input(aTmp.path);
-
-    if (["m4a", "mp4"].includes(audioF.container)) {
-      mux.audioCodec("copy"); // keep AAC
-    } else {
-      mux.audioCodec("aac").audioBitrate("192k"); // Opus → AAC
-    }
-
-    mux
+    ffmpeg()
+      .input(vTmp.path)
+      .videoCodec("copy")
+      .input(aTmp.path)
+      .audioCodec(
+        audioF.container === "mp4" || audioF.container === "m4a"
+          ? "copy"
+          : "aac"
+      )
+      .audioBitrate("192k")
       .outputOptions("-movflags", "frag_keyframe+empty_moov")
       .format("mp4")
-      .on("start", (cmd) => console.log("[ffmpeg]", cmd))
-      .on("stderr", (l) => process.stdout.write("[ffmpeg] " + l))
       .on("error", (e) => {
         console.error("FFmpeg error:", e);
-        if (!res.headersSent) res.status(500).end("FFmpeg failed");
-        else res.end();
+        res.end();
       })
       .on("end", () => {
-        console.log("FFmpeg completed successfully");
-        // Clean up temp files
         fs.unlink(vTmp.path, () => {});
         fs.unlink(aTmp.path, () => {});
       })
@@ -240,16 +211,19 @@ app.get("/download", async (req, res) => {
   }
 });
 
-/* helper: ytdl stream → file */
+/* helper: stream → file */
 function save(url, format, out) {
   return new Promise((ok, fail) => {
     const ws = fs.createWriteStream(out);
-    ytdl(url, { format }).pipe(ws).on("finish", ok).on("error", fail);
+    ytdl(url, { ...COMMON, format })
+      .pipe(ws)
+      .on("finish", ok)
+      .on("error", fail);
   });
 }
 
-// Error handling middleware
-app.use((err, req, res, next) => {
+/* fallback error middleware */
+app.use((err, _req, res, _next) => {
   console.error("Unhandled error:", err);
   res.status(500).json({ error: "Internal server error" });
 });
