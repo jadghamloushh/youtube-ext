@@ -1,86 +1,74 @@
-/* ------------------------------------------------------------------
-   High-res YouTube downloader  —  local or Render deployment
-   ------------------------------------------------------------------ */
-
-const express = require("express");
-const cors = require("cors");
-const ytdl = require("ytdl-core");
-const pretty = require("pretty-bytes");
-const ffmpeg = require("fluent-ffmpeg");
-
-const { file } = require("tmp-promise");
-const fs = require("fs");
-const path = require("path");
+// server.js
+import express from "express";
+import cors from "cors";
+import ytdl from "@distube/ytdl-core"; // 4.16.x or newer
+import prettyBytes from "pretty-bytes";
+import ffmpeg from "fluent-ffmpeg";
+import { file } from "tmp-promise";
+import fs from "fs";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-/* ------------------------------------------------ CORS ---------- */
-// Allow:
-//
-//   • Any Chrome or Firefox web-extension origin
-//   • Your Render URL  (set RENDER_HOST env var to "youtube-ext-1.onrender.com")
-//   • localhost (no Origin header)
-//
-const RENDER_HOST_RE = new RegExp(
-  `^https://(${process.env.RENDER_HOST || "youtube-ext-1.onrender.com"})$`
-);
+/* ------------------ 1.  global request headers ------------------- */
+const COMMON = {
+  requestOptions: {
+    headers: {
+      "user-agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+        "AppleWebKit/537.36 (KHTML, like Gecko) " +
+        "Chrome/126.0 Safari/537.36",
+      cookie: process.env.YT_COOKIE || "",
+    },
+  },
+};
 
+/* ----------------------- 2. middleware --------------------------- */
 app.use(
   cors({
-    origin(origin, cb) {
-      if (
-        !origin || // curl / localhost
-        origin.startsWith("chrome-extension://") ||
-        origin.startsWith("moz-extension://") ||
-        RENDER_HOST_RE.test(origin)
-      ) {
-        return cb(null, true);
-      }
-      cb(new Error(`CORS blocked: ${origin}`));
-    },
+    origin: ["chrome-extension://*", "moz-extension://*", "*"],
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
 
-/* --------------------------------------------- logging ---------- */
-app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()}  ${req.method}  ${req.url}`);
+app.use((req, _res, next) => {
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.url}`);
   next();
 });
 
-/* --------------------------------------- health-check ---------- */
-app.get("/", (_req, res) =>
+/* simple health check */
+app.get("/", (_req, res) => {
   res.json({
     status: "OK",
-    message: "YouTube Downloader API",
+    message: "YouTube Downloader API is running",
     endpoints: ["/info", "/download"],
     timestamp: new Date().toISOString(),
-  })
-);
+  });
+});
 
-/* 15-minute in-memory cache for /info */
+/* ------------------ 3.  15-min in-memory cache ------------------- */
 const cache = new Map();
 const TTL = 900_000;
 
-/* ------------------------------------------------ /info ---------- */
+/* -------------------------- /info -------------------------------- */
 app.get("/info", async (req, res) => {
   const videoUrl = req.query.url;
-
-  if (!videoUrl)
-    return res.status(400).json({ error: "Missing URL parameter" });
+  if (!videoUrl) return res.status(400).json({ error: "Missing url param" });
   if (!ytdl.validateURL(videoUrl))
     return res.status(400).json({ error: "Invalid YouTube URL" });
 
   if (cache.has(videoUrl)) return res.json(cache.get(videoUrl));
 
   try {
-    /* basic → full fallback to dodge occasional “no formats” bug */
     let info;
     try {
-      info = await ytdl.getBasicInfo(videoUrl);
-      if (!info.formats?.length) info = await ytdl.getInfo(videoUrl);
-    } catch (_) {
-      info = await ytdl.getInfo(videoUrl);
+      info = await ytdl.getBasicInfo(videoUrl, COMMON);
+      if (!info.formats?.length) {
+        info = await ytdl.getInfo(videoUrl, COMMON);
+      }
+    } catch {
+      info = await ytdl.getInfo(videoUrl, COMMON);
     }
 
     const title = info.videoDetails.title;
@@ -105,11 +93,11 @@ app.get("/info", async (req, res) => {
 
     const formats = Object.entries(buckets)
       .filter(([, f]) => f)
-      .map(([label, f]) => ({
+      .map(([k, f]) => ({
         itag: f.itag,
-        label: label === "audio" ? "Audio only" : label,
+        label: k === "audio" ? "Audio only" : k,
         ext: "MP4",
-        sizeMB: f.contentLength ? pretty(+f.contentLength) : "—",
+        sizeMB: f.contentLength ? prettyBytes(+f.contentLength) : "—",
       }));
 
     if (!formats.length)
@@ -121,25 +109,21 @@ app.get("/info", async (req, res) => {
 
     return res.json(payload);
   } catch (err) {
-    console.error("[/info] error:", err.message);
-    const msg = err.message || "unknown";
-
-    if (msg.includes("Video unavailable"))
-      return res
-        .status(410)
-        .json({ error: "Video unavailable or region-blocked." });
-    if (msg.includes("confirm your age"))
-      return res
-        .status(451)
-        .json({ error: "Age-restricted, sign-in required." });
-    if (msg.includes("Status code: 403") || msg.includes("Status code: 429"))
-      return res.status(429).json({ error: "Rate-limited by YouTube." });
-
+    console.error("[/info] FULL error:", err);
+    const msg = String(err?.message || "");
+    if (msg.includes("age"))
+      return res.status(451).json({ error: "Age-restricted." });
+    if (msg.includes("403"))
+      return res.status(429).json({ error: "Throttled by YouTube." });
+    if (msg.includes("429"))
+      return res.status(429).json({ error: "Rate-limited." });
+    if (msg.includes("unavailable"))
+      return res.status(410).json({ error: "Video unavailable." });
     return res.status(500).json({ error: "Failed to fetch video info" });
   }
 });
 
-/* ----------------------------------------------- /download ------ */
+/* ------------------------- /download ----------------------------- */
 app.get("/download", async (req, res) => {
   const { url: videoUrl, itag } = req.query;
   if (!ytdl.validateURL(videoUrl))
@@ -147,29 +131,33 @@ app.get("/download", async (req, res) => {
   if (!itag) return res.status(400).send("Missing itag parameter");
 
   try {
-    const info = await ytdl.getInfo(videoUrl);
+    const info = await ytdl.getInfo(videoUrl, COMMON);
     const videoF = info.formats.find((f) => f.itag == itag);
     if (!videoF) return res.status(404).send("itag not found");
 
-    const safeTitle = info.videoDetails.title.replace(/[^\w\s\-]/g, "").trim();
-    res.setHeader(
+    const safeTitle = info.videoDetails.title.replace(/[^\w\s\-]/g, "");
+    res.header(
       "Content-Disposition",
       `attachment; filename="${safeTitle}.mp4"`
     );
-    res.setHeader("Content-Type", "video/mp4");
+    res.header("Content-Type", "video/mp4");
 
-    /* ≤ 360p already contains audio */
-    if (videoF.hasAudio) return ytdl(videoUrl, { format: videoF }).pipe(res);
+    if (videoF.hasAudio) {
+      return ytdl(videoUrl, { ...COMMON, format: videoF }).pipe(res);
+    }
 
-    /* higher → merge separate audio */
-    const audioF =
-      info.formats.find(
-        (f) => f.hasAudio && !f.hasVideo && /^(m4a|mp4|webm)$/.test(f.container)
-      ) ||
-      ytdl.chooseFormat(info.formats, {
+    let audioF = info.formats.find(
+      (f) =>
+        f.hasAudio &&
+        !f.hasVideo &&
+        (f.container === "m4a" || f.container === "mp4")
+    );
+    if (!audioF) {
+      audioF = ytdl.chooseFormat(info.formats, {
         quality: "highestaudio",
         filter: "audioonly",
       });
+    }
 
     const vTmp = await file({ postfix: ".mp4" });
     const aTmp = await file({
@@ -181,48 +169,50 @@ app.get("/download", async (req, res) => {
       save(videoUrl, audioF, aTmp.path),
     ]);
 
-    const mux = ffmpeg().input(vTmp.path).videoCodec("copy").input(aTmp.path);
-
-    if (["m4a", "mp4"].includes(audioF.container)) {
-      mux.audioCodec("copy"); // keep AAC
-    } else {
-      mux.audioCodec("aac").audioBitrate("192k"); // Opus → AAC
-    }
-
-    mux
-      .format("mp4")
-      .outputOptions("-movflags", "faststart") // seekable after download
-      .on("error", (e) => {
-        console.error("FFmpeg error:", e.message || e);
-        if (!res.headersSent) res.status(500).end("FFmpeg failed");
-      })
-      .on("end", () =>
-        [vTmp.path, aTmp.path].forEach((p) => fs.unlink(p, () => {}))
+    ffmpeg()
+      .input(vTmp.path)
+      .videoCodec("copy")
+      .input(aTmp.path)
+      .audioCodec(
+        audioF.container === "mp4" || audioF.container === "m4a"
+          ? "copy"
+          : "aac"
       )
+      .audioBitrate("192k")
+      .outputOptions("-movflags", "frag_keyframe+empty_moov")
+      .format("mp4")
+      .on("error", (e) => {
+        console.error("FFmpeg error:", e);
+        res.end();
+      })
+      .on("end", () => {
+        fs.unlink(vTmp.path, () => {});
+        fs.unlink(aTmp.path, () => {});
+      })
       .pipe(res, { end: true });
   } catch (err) {
-    console.error("[/download] error:", err.message);
-    res.status(500).send(`Download failed: ${err.message}`);
+    console.error("Download error:", err);
+    res.status(500).send("Download failed: " + err.message);
   }
 });
 
-/* ytdl stream → temporary file */
-function save(url, format, outPath) {
+function save(url, format, out) {
   return new Promise((ok, fail) => {
-    ytdl(url, { format })
-      .pipe(fs.createWriteStream(outPath))
+    const ws = fs.createWriteStream(out);
+    ytdl(url, { ...COMMON, format })
+      .pipe(ws)
       .on("finish", ok)
       .on("error", fail);
   });
 }
 
-/* global error handler */
+/* fallback error middleware */
 app.use((err, _req, res, _next) => {
   console.error("Unhandled error:", err);
-  if (!res.headersSent)
-    res.status(500).json({ error: "Internal server error" });
+  res.status(500).json({ error: "Internal server error" });
 });
 
 app.listen(PORT, () => {
   console.log(`▶️  Server running on port ${PORT}`);
+  console.log(`Environment: ${process.env.NODE_ENV || "development"}`);
 });
